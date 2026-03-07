@@ -1,0 +1,25 @@
+# Secrets
+.env
+.shuffle-webhook-id
+
+# Generated reports (keep dir, ignore contents)
+reports/*.json
+
+# Docker volume data directories (if bind-mount style)
+mysql-data/
+redis-data/
+misp-data/
+opensearch-data/
+shuffle-data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,59 @@
+{
+  "id": "e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b",
+  "name": "OT/ICS Firmware Findings Import",
+  "description": "Receives firmware vulnerability research findings via webhook. Creates one MISP event per firmware image, adds a software object, adds one vulnerability object per finding (standard fields + ICS scoring fields stored with force=1), adds file and port attributes, and triggers CVE enrichment via the MISP cve module. Review events in MISP, then trigger OT/ICS Firmware Triage.",
+  "start": "trigger_webhook",
+  "tags": ["ot", "ics", "firmware", "misp", "import"],
+  "workflow_variables": [
+    {
+      "description": "MISP base URL — auto-patched by init-lab.sh",
+      "id": "wv_misp_url",
+      "name": "MISP_URL",
+      "value": "http://misp-core"
+    },
+    {
+      "description": "MISP REST API key — auto-patched by init-lab.sh",
+      "id": "wv_misp_key",
+      "name": "MISP_API_KEY",
+      "value": "REPLACE_WITH_YOUR_MISP_API_KEY"
+    }
+  ],
+  "triggers": [
+    {
+      "app_name": "Webhook",
+      "description": "POST findings.json body — called by: bash scripts/import.sh --file findings.json",
+      "id": "trigger_webhook",
+      "label": "Firmware Findings Input",
+      "name": "Webhook",
+      "parameters": [{"name": "base64_encoded", "value": "false"}],
+      "status": "running",
+      "type": "WEBHOOK"
+    }
+  ],
+  "actions": [
+    {
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "id": "act_import",
+      "is_valid": true,
+      "label": "import",
+      "name": "execute_python",
+      "parameters": [
+        {
+          "name": "code",
+          "value": "import json\nimport time\nimport urllib.request\nimport urllib.error\n\n\n_TEMPLATES = {\n    'software': {\n        'meta-category': 'misc',\n        'description': 'Software object',\n        'uuid': 'b1b5dc0e-73fe-443c-8d9d-0e208de3951e',\n        'version': '1',\n    },\n    'vulnerability': {\n        'meta-category': 'vulnerability',\n        'description': 'Vulnerability object',\n        'uuid': '81650945-f186-437b-8945-9f31715d32da',\n        'version': '12',\n    },\n    'file': {\n        'meta-category': 'file',\n        'description': 'File object',\n        'uuid': '688c46fb-5edb-40a3-8273-1af7923e2215',\n        'version': '25',\n    },\n}\n\n\ndef http_post(url, body, extra_headers=None, timeout=15):\n    try:\n        data = json.dumps(body).encode()\n        h = {'Content-Type': 'application/json', 'Accept': 'application/json'}\n        if extra_headers:\n            h.update(extra_headers)\n        req = urllib.request.Request(url, data=data, headers=h, method='POST')\n        with urllib.request.urlopen(req, timeout=timeout) as r:\n            return json.loads(r.read()), None\n    except urllib.error.HTTPError as e:\n        snippet = ''\n        try:\n            snippet = e.read().decode()[:160]\n        except Exception:\n            pass\n        return {}, 'HTTP ' + str(e.code) + ': ' + snippet\n    except Exception as e:\n        return {}, str(e)\n\n\ndef _auth(key):\n    return {'Authorization': key}\n\n\ndef add_object(eid, name, attrs, url, key):\n    rows = [\n        {'object_relation': a['r'], 'type': a.get('t', 'text'), 'value': str(a['v'])}\n        for a in attrs if a.get('v') not in (None, '', [])\n    ]\n    if not rows:\n        return None\n    tmpl = _TEMPLATES.get(name, {})\n    body = {\n        'name': name,\n        'meta-category': tmpl.get('meta-category', 'misc'),\n        'description': tmpl.get('description', name),\n        'template_uuid': tmpl.get('uuid', ''),\n        'template_version': tmpl.get('version', '1'),\n        'force': 1,\n        'Attribute': rows,\n    }\n    _, err = http_post(url + '/objects/add/' + eid, body, extra_headers=_auth(key))\n    return err\n\n\ndef add_attr(eid, atype, value, category, url, key):\n    if value in (None, '', 0):\n        return None\n    _, err = http_post(\n        url + '/attributes/add/' + eid,\n        {'Attribute': {'type': atype, 'category': category, 'value': str(value)}},\n        extra_headers=_auth(key),\n    )\n    return err\n\n\ndef run(raw, misp_url, misp_key):\n    if isinstance(raw, str):\n        raw = json.loads(raw)\n\n    batch   = raw.get('research_batch', {})\n    fw_list = raw.get('firmware', [])\n    if not fw_list:\n        return json.dumps({'error': 'firmware list empty or missing'})\n\n    errors  = []\n    created = []\n\n    for fw in fw_list:\n        vendor  = fw.get('vendor', 'Unknown')\n        product = fw.get('product', 'Unknown')\n        version = fw.get('version', '')\n        vulns   = fw.get('vulnerabilities', [])\n\n        scores = [float(v.get('cvss_score') or 0) for v in vulns]\n        m  = max(scores, default=0)\n        tl = 1 if m >= 9 else 2 if m >= 7 else 3 if m >= 4 else 4\n\n        r, err = http_post(\n            misp_url + '/events',\n            {'Event': {'info': 'Firmware research -- ' + vendor + ' ' + product + ' ' + version,\n                       'analysis': 1, 'threat_level_id': tl, 'distribution': 0}},\n            extra_headers=_auth(misp_key),\n        )\n        eid = str(r.get('Event', {}).get('id', ''))\n        if err:\n            errors.append('create_event(' + vendor + ' ' + product + '): ' + err)\n        if not eid:\n            continue\n\n        err = add_object(eid, 'software', [\n            {'r': 'name',    'v': product},\n            {'r': 'version', 'v': version},\n            {'r': 'vendor',  'v': vendor},\n        ], misp_url, misp_key)\n        if err:\n            errors.append('software_obj(' + vendor + ' ' + product + '): ' + err)\n\n        err = add_attr(eid, 'sha256',   fw.get('firmware_sha256', ''), 'Artifacts dropped', misp_url, misp_key)\n        if err:\n            errors.append('sha256(' + vendor + '): ' + err)\n        err = add_attr(eid, 'filename', fw.get('firmware_file',   ''), 'Artifacts dropped', misp_url, misp_key)\n        if err:\n            errors.append('filename(' + vendor + '): ' + err)\n\n        has_cve = False\n        for vuln in vulns:\n            cve_id = vuln.get('cve')\n            rid    = vuln.get('research_id') or cve_id or 'UNKNOWN'\n\n            if cve_id:\n                err = add_attr(eid, 'vulnerability', cve_id, 'External analysis', misp_url, misp_key)\n                if err:\n                    errors.append('vuln_attr(' + rid + '): ' + err)\n                has_cve = True\n\n            err = add_object(eid, 'vulnerability', [\n                {'r': 'id',                  'v': rid},\n                {'r': 'summary',             'v': vuln.get('title', '')},\n                {'r': 'description',         'v': vuln.get('description', '')},\n                {'r': 'cvss-score',          'v': vuln.get('cvss_score'), 't': 'float'},\n                {'r': 'cwe',                 'v': vuln.get('cwe', '')},\n                {'r': 'cve',                 'v': cve_id or ''},\n                {'r': 'state',               'v': vuln.get('disclosure_status', 'private')},\n                {'r': 'exploit-complexity',  'v': vuln.get('exploit_complexity', '')},\n                {'r': 'operational-impact',  'v': vuln.get('operational_impact', '')},\n                {'r': 'exposure',            'v': vuln.get('exposure', '')},\n                {'r': 'poc-available',       'v': str(vuln.get('poc_available', False))},\n            ], misp_url, misp_key)\n            if err:\n                errors.append('vuln_obj(' + rid + '): ' + err)\n\n            if vuln.get('affected_binary'):\n                err = add_object(eid, 'file', [\n                    {'r': 'path',   'v': vuln['affected_binary']},\n                    {'r': 'sha256', 'v': vuln.get('binary_sha256', '')},\n                ], misp_url, misp_key)\n                if err:\n                    errors.append('file_obj(' + rid + '): ' + err)\n\n            if vuln.get('trigger_port'):\n                err = add_attr(eid, 'port', str(vuln['trigger_port']), 'Network activity', misp_url, misp_key)\n                if err:\n                    errors.append('port(' + rid + '): ' + err)\n\n        if has_cve:\n            http_post(misp_url + '/events/enrichEvent/' + eid, {'cve': True}, extra_headers=_auth(misp_key))\n            time.sleep(10)\n\n        created.append({'vendor': vendor, 'product': product,\n                        'version': version, 'misp_event_id': eid})\n\n    return json.dumps({\n        'success':     len(created) > 0,\n        'batch':       batch,\n        'created':     created,\n        'error_count': len(errors),\n        'errors':      errors,\n    }, indent=2)\n\n\nitems = json.loads(\"\"\"$exec\"\"\")\nprint(run(items, '$MISP_URL', '$MISP_API_KEY'))\n",
+          "variant": "STATIC_VALUE"
+        }
+      ],
+      "position": {"x": 240, "y": 200},
+      "priority": 0
+    }
+  ],
+  "branches": [
+    {
+      "destination_id": "act_import",
+      "id": "br_1",
+      "source_id": "trigger_webhook"
+    }
+  ]
+}

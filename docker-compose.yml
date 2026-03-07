@@ -1,0 +1,214 @@
+# ============================================================
+#  OT/ICS Threat Intelligence Lab
+#  MISP + Shuffle — local triage environment
+#
+#  Usage:
+#    cp .env.example .env   # edit passwords
+#    docker compose up -d
+#    bash scripts/init-lab.sh
+# ============================================================
+
+networks:
+  ot-triage:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  misp-mysql:
+  misp-redis:
+  misp-files:
+  misp-logs:
+  shuffle-opensearch:
+  shuffle-apps:
+  shuffle-files:
+
+services:
+
+  # ── MISP: MySQL ───────────────────────────────────────────
+  misp-db:
+    image: mysql:8.0.45
+    container_name: misp-db
+    restart: no
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --innodb-buffer-pool-size=256M
+      --max-allowed-packet=64M
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE:      misp
+      MYSQL_USER:          misp
+      MYSQL_PASSWORD:      ${MYSQL_PASSWORD}
+    volumes:
+      - misp-mysql:/var/lib/mysql
+    networks:
+      - ot-triage
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1",
+             "-umisp", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── MISP: Redis ───────────────────────────────────────────
+  misp-redis:
+    image: redis:7.4.8-alpine
+    container_name: misp-redis
+    restart: no
+    command: redis-server --appendonly yes
+    volumes:
+      - misp-redis:/data
+    networks:
+      - ot-triage
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── MISP: Core Application ────────────────────────────────
+  misp-core:
+    image: ghcr.io/misp/misp-docker/misp-core:latest@sha256:21067bbc5dcf44104e27eb751d23bd77ec46c34e68676fe82a41fc3d96dac1da
+    container_name: misp-core
+    restart: no
+    depends_on:
+      misp-db:
+        condition: service_healthy
+      misp-redis:
+        condition: service_healthy
+    environment:
+      # Database
+      MYSQL_HOST:          misp-db
+      MYSQL_PORT:          "3306"
+      MYSQL_USER:          misp
+      MYSQL_PASSWORD:      ${MYSQL_PASSWORD}
+      MYSQL_DATABASE:      misp
+      # Redis — official image env var names
+      REDIS_HOST:          misp-redis
+      REDIS_PORT:          "6379"
+      ENABLE_REDIS_EMPTY_PASSWORD: "true"
+      # Admin / org — official image env var names
+      ADMIN_EMAIL:         ${MISP_ADMIN_EMAIL}
+      ADMIN_PASSWORD:      ${MISP_ADMIN_PASSPHRASE}
+      ADMIN_ORG:           ${MISP_ORG}
+      BASE_URL:            "http://localhost:${MISP_PORT:-8080}"
+      # Disable HTTP→HTTPS redirect (local lab, no TLS needed)
+      DISABLE_SSL_REDIRECT: "true"
+      TZ: Europe/Amsterdam
+    volumes:
+      - misp-files:/var/www/MISP/app/files
+      - misp-logs:/var/www/MISP/app/tmp/logs
+    ports:
+      - "${MISP_PORT:-8080}:80"
+    networks:
+      - ot-triage
+
+  # ── MISP: Enrichment Modules ──────────────────────────────
+  misp-modules:
+    image: ghcr.io/misp/misp-docker/misp-modules:latest@sha256:4698b48550743c4e2df5209633e45436cee73d65ac1ccae99dea76cec8b5415b
+    container_name: misp-modules
+    restart: no
+    networks:
+      - ot-triage
+
+  # ── Shuffle: OpenSearch (datastore) ──────────────────────
+  shuffle-opensearch:
+    image: opensearchproject/opensearch:2.10.0
+    container_name: shuffle-opensearch
+    restart: no
+    environment:
+      bootstrap.memory_lock:        "true"
+      OPENSEARCH_JAVA_OPTS:         "-Xms512m -Xmx512m"
+      DISABLE_INSTALL_DEMO_CONFIG:  "true"
+      DISABLE_SECURITY_PLUGIN:      "true"
+      discovery.type:               single-node
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - shuffle-opensearch:/usr/share/opensearch/data
+    networks:
+      - ot-triage
+    healthcheck:
+      test: ["CMD-SHELL",
+             "curl -sf http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
+
+  # ── Shuffle: Backend ──────────────────────────────────────
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest@sha256:271b38ba5d2c68579f0d75b43d294b65626f57a7878eef545b8021c07b3e178d
+    container_name: shuffle-backend
+    hostname: shuffle-backend
+    restart: no
+    depends_on:
+      shuffle-opensearch:
+        condition: service_healthy
+    environment:
+      DATASTORE_EMULATOR_HOST:   shuffle-opensearch:9200
+      SHUFFLE_OPENSEARCH_URL:    http://shuffle-opensearch:9200
+      SHUFFLE_APP_HOTLOAD_FOLDER: /shuffle-apps
+      SHUFFLE_FILE_LOCATION:     /shuffle-files
+      SHUFFLE_DEFAULT_USERNAME:  ${SHUFFLE_ADMIN_EMAIL}
+      SHUFFLE_DEFAULT_PASSWORD:  ${SHUFFLE_ADMIN_PASSWORD}
+      SHUFFLE_DEFAULT_APIKEY:    ${SHUFFLE_DEFAULT_APIKEY:-}
+      HTTP_PROXY:                ""
+      HTTPS_PROXY:               ""
+    volumes:
+      - shuffle-apps:/shuffle-apps
+      - shuffle-files:/shuffle-files
+      - ./reports:/reports        # triage reports land here on the host
+    ports:
+      - "5001:5001"
+    networks:
+      - ot-triage
+
+  # ── Shuffle: Orborus (workflow action executor) ───────────
+  shuffle-orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:latest@sha256:e74e0246ba3acd0daaa8343e58da859f7908f06b9f51094a9cd9f9ea8cbf7a44
+    container_name: shuffle-orborus
+    hostname: shuffle-orborus
+    restart: no
+    depends_on:
+      - shuffle-backend
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      ENVIRONMENT_NAME:          Shuffle
+      ORG_ID:                    Shuffle
+      BASE_URL:                  http://shuffle-backend:5001
+      DOCKER_API_VERSION:        "1.40"
+      SHUFFLE_SWARM_CONFIG:      run
+      SHUFFLE_STATS_DISABLED:    "true"
+      SHUFFLE_LOGS_DISABLED:     "true"
+      CLEANUP:                   "true"
+      SHUFFLE_WORKER_IMAGE:      ghcr.io/shuffle/shuffle-worker:latest@sha256:72e89cbf995f7b1977e0f100d23af0f16ef5a15cf6311fd4f5628667a154fa5c
+      HTTP_PROXY:                ""
+      HTTPS_PROXY:               ""
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - ot-triage
+
+  # ── Shuffle: Frontend ─────────────────────────────────────
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest@sha256:3c471f39c4d0a773ee22ed8575a68579ff08dd7123e94e70a2482973a4cc296f
+    container_name: shuffle-frontend
+    restart: no
+    depends_on:
+      - shuffle-backend
+    environment:
+      BACKEND_HOSTNAME: shuffle-backend
+      BACKEND_PORT:     "5001"
+    ports:
+      - "${SHUFFLE_PORT:-3001}:80"
+    networks:
+      - ot-triage
