@@ -1,6 +1,8 @@
 # Secrets
 .env
 .shuffle-webhook-id
+.shuffle-triage-webhook-id
+.shuffle-import-webhook-id
 
 # Generated reports (keep dir, ignore contents)
 reports/*.json
