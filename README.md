@@ -129,6 +129,6 @@ make clean
 | Shuffle Orborus  | `ghcr.io/shuffle/shuffle-orborus:latest`       | internal |
 | OpenSearch 2.10  | `opensearchproject/opensearch:2.10.0`          | internal |
 
-## License
+## Licence
 
-[Unlicense](LICENSE)
+[Unlicence](LICENCE)
