@@ -1,19 +1,21 @@
-# OT/ICS Threat Intelligence Lab
+# Watch Tower
 
-Local threat intelligence lab for ICS/OT firmware vulnerability research.
+The Watch Tower does not look for threats. It takes findings that have already been made, enriches them with threat context, scores them against what is known to be actively exploited, and produces intelligence that tells an analyst whether a vulnerability is theoretical or immediately relevant.
+
+It is an intelligence platform for industrial control systems and embedded infrastructure. Findings arrive as structured data. By the time they reach an analyst, each carries a risk score, exploitation context, and a MISP event record linking it to the broader threat picture. The platform does not make decisions. It produces scored, contextualised intelligence and puts it in front of a person who does.
 
 ```
-firmware lab findings
+firmware vulnerability findings
         ↓
-ingestion/ingest_findings.py
+ingestion (webhook or JSON import)
         ↓
-Shuffle webhook
+MISP event creation  ·  Shuffle orchestrator
         ↓
-MISP event + enrichment (cve module → CIRCL + CWE)
+CVE enrichment (CIRCL CVE Search – local corpus)
         ↓
-CISA KEV  ·  EPSS  ·  ICS triage scoring
+CISA KEV check  ·  EPSS scoring
         ↓
-analyst review in MISP + ENISA CVD disclosure drafts
+analyst review and determination
 ```
 
 Stack: MISP + Shuffle (SOAR) + CIRCL CVE Search + CISA KEV + EPSS
@@ -31,8 +33,7 @@ Minimum hardware (all services combined):
 | CPU      | 4 cores                   | 8 cores     |
 | Disk     | 20 GB free                | 40 GB       |
 
-MISP core + MySQL + OpenSearch are the heavy consumers. If Docker Desktop is
-used, set its memory limit to at least 8 GB in Settings → Resources.
+MISP core + MySQL + OpenSearch are the heavy consumers. If Docker Desktop is used, set its memory limit to at least 8 GB in Settings → Resources.
 
 ## Quick start
 
@@ -44,39 +45,54 @@ make start             # pull images and start all services
 *Note on `make start` output: Docker Compose uses an animated progress bar that re-renders in place using terminal escape codes. Each refresh prints as a new line in some terminals, which looks like a loop but is not. The actual container status is printed at the end.*
 
 ```bash
-make init              # configure MISP, import Shuffle workflows
+make init              # configure MISP, import Shuffle workflows, download CVE corpus
 ```
 
-*Note on first boot: `make init` waits automatically until MISP is ready before proceeding. On a fresh volume this can take 3-5 minutes while MISP runs database migrations and seeds default data.*
+*Note on first boot: `make init` waits automatically until MISP is ready before proceeding. On a fresh volume this can take 3-5 minutes while MISP runs database migrations and seeds default data. The CVE corpus download adds further time on first run; subsequent starts skip it.*
 
 ## Usage
 
 ```bash
-# Import the built-in example into MISP
-bash scripts/import.sh --example
+# Import the built-in examples and verify the pipeline end-to-end
+make import-examples
 
 # Import your own findings
-bash scripts/import.sh --file findings.json
+make import FILE=path/to/findings.json
 
-# Run triage on all events in MISP
-bash scripts/triage.sh
+# Scored summary of all pending events, ordered by composite risk score
+make triage
 ```
 
-The import script normalises findings and posts them to Shuffle. One MISP event
-per firmware image is created, with enriched vulnerability objects. Triage reads
-all events and writes scored summaries back to each event.
+The import pipeline is idempotent: importing the same finding twice produces one MISP event, not two.
+
+Findings are normalised and posted to Shuffle. One MISP event per firmware image is created, enriched with CVE data, checked against the CISA KEV catalogue, and scored with EPSS. Triage reads all pending events and writes scored summaries back for analyst review.
 
 See [docs/schema.md](docs/schema.md) for the input format.
+
+## Analyst triage
+
+Each enriched MISP event carries: the original finding, CVE data (CVSS score and vector, affected versions, NVD references), KEV status (whether CISA has confirmed active exploitation), and EPSS score (probability of exploitation in the next 30 days).
+
+A finding with a CVSS of 9.8, a KEV entry, and an EPSS above 0.5 is an immediate concern regardless of which device it affects. A finding with CVSS of 5.0, no KEV match, and EPSS below 0.1 warrants attention but not urgency.
+
+Some considerations that consistently inform good triage decisions:
+
+- **KEV match overrides CVSS arithmetic.** A medium-severity vulnerability being actively exploited is more dangerous than a critical-severity one with no observed exploitation.
+- **EPSS is a probability estimate, not a verdict.** Whether a given score matters depends on how many devices run the affected firmware and what those devices do.
+- **Device context is not in the platform.** The Watch Tower knows about vulnerabilities; it does not independently know whether a device is deployed in critical infrastructure. That context comes from the analyst.
+
+Determination outcomes: no further action, notification (quiet disclosure to manufacturer, operator, or national CERT), or escalation. Every determination is recorded in the MISP event. The audit trail runs from the original finding through enrichment to the decision.
 
 ## Useful commands
 
 ```bash
 # Logs
+make logs
 docker compose logs -f misp-core
 docker compose logs -f shuffle-backend
 
-# Get MISP API key
-bash scripts/get-misp-key.sh
+# Get MISP API credentials
+make creds
 
 # Restart a service
 docker compose restart misp-core
@@ -115,4 +131,4 @@ make clean
 
 ## License
 
-MIT
+Unlicense
