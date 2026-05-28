@@ -1,6 +1,6 @@
 # ============================================================
-#  OT/ICS Threat Intelligence Lab
-#  MISP + Shuffle — local triage environment
+#  Watch Tower
+#  MISP + Shuffle: OT/ICS firmware vulnerability intelligence
 #
 #  Usage:
 #    cp .env.example .env   # edit passwords
